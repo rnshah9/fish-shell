@@ -1,4 +1,4 @@
 project: fish-shell
 target: fish
 cmds:
-  - cmd: /repo/build/fish
+  - cmd: /install/bin/fish
