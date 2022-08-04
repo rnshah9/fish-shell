@@ -11,7 +11,6 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -96,6 +95,10 @@ bool wreaddir(DIR *dir, wcstring &out_name) {
     return true;
 }
 
+/// Wrapper for readdir that tries to only return directories.
+/// This is only supported on some (file)systems,
+/// and includes links,
+/// so the caller still needs to check.
 bool readdir_for_dirs(DIR *dir, std::string *out_name) {
     struct dirent *result = nullptr;
     while (!result) {
@@ -110,7 +113,9 @@ bool readdir_for_dirs(DIR *dir, std::string *out_name) {
                 break;  // these may be directories
             }
             default: {
-                break;  // nothing else can
+                // these definitely aren't - skip
+                result = nullptr;
+                continue;
             }
         }
 #else
@@ -860,6 +865,22 @@ static int compare(T a, T b) {
         return 1;
     }
     return 0;
+}
+
+/// \return true if \param rhs has higher mtime seconds than this file_id_t.
+/// If identical, nanoseconds are compared.
+bool file_id_t::older_than(const file_id_t &rhs) const {
+    int ret = compare(mod_seconds, rhs.mod_seconds);
+    if (!ret) ret = compare(mod_nanoseconds, rhs.mod_nanoseconds);
+    switch (ret) {
+        case -1:
+            return true;
+        case 1:
+        case 0:
+            return false;
+        default:
+            DIE("unreachable");
+    }
 }
 
 int file_id_t::compare_file_id(const file_id_t &rhs) const {

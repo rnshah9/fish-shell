@@ -12,6 +12,8 @@
 #include "../common.h"
 #include "../fallback.h"  // IWYU pragma: keep
 #include "../io.h"
+#include "../parser.h"
+#include "../path.h"
 #include "../wcstringutil.h"
 #include "../wgetopt.h"
 #include "../wutil.h"  // IWYU pragma: keep
@@ -99,7 +101,15 @@ maybe_t<int> builtin_realpath(parser_t &parser, io_streams_t &streams, const wch
             return STATUS_CMD_ERROR;
         }
     } else {
-        wcstring absolute_arg = string_prefixes_string(L"/", arg) ? arg : wgetcwd() + L"/" + arg;
+        // We need to get the *physical* pwd here.
+        auto realpwd = wrealpath(parser.vars().get_pwd_slash());
+        if (!realpwd) {
+            streams.err.append_format(L"builtin %ls: realpath failed: %s\n", cmd,
+                                      std::strerror(errno));
+            return STATUS_CMD_ERROR;
+        }
+        wcstring absolute_arg =
+            string_prefixes_string(L"/", arg) ? arg : path_apply_working_directory(arg, *realpwd);
         streams.out.append(normalize_path(absolute_arg, /* allow leading double slashes */ false));
     }
 

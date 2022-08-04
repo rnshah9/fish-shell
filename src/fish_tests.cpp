@@ -71,6 +71,7 @@
 #include "parser.h"
 #include "path.h"
 #include "proc.h"
+#include "re.h"
 #include "reader.h"
 #include "redirection.h"
 #include "screen.h"
@@ -404,7 +405,7 @@ static void test_escape_crazy() {
             random_string.push_back((random() % ESCAPE_TEST_CHAR) + 1);
         }
 
-        escaped_string = escape_string(random_string, ESCAPE_ALL);
+        escaped_string = escape_string(random_string);
         unescaped_success = unescape_string(escaped_string, &unescaped_string, UNESCAPE_DEFAULT);
 
         if (!unescaped_success) {
@@ -417,10 +418,9 @@ static void test_escape_crazy() {
         }
     }
 
-    // Verify that not using `ESCAPE_ALL` also escapes backslashes so we don't regress on issue
-    // #3892.
+    // Verify that ESCAPE_NO_PRINTABLES also escapes backslashes so we don't regress on issue #3892.
     random_string = L"line 1\\n\nline 2";
-    escaped_string = escape_string(random_string, ESCAPE_NO_QUOTED);
+    escaped_string = escape_string(random_string, ESCAPE_NO_PRINTABLES | ESCAPE_NO_QUOTED);
     unescaped_success = unescape_string(escaped_string, &unescaped_string, UNESCAPE_DEFAULT);
     if (!unescaped_success) {
         err(L"Failed to unescape string <%ls>", escaped_string.c_str());
@@ -478,7 +478,7 @@ static void test_format() {
     for (int j = -129; j <= 129; j++) {
         char buff1[128], buff2[128];
         format_long_safe(buff1, j);
-        sprintf(buff2, "%d", j);
+        snprintf(buff2, 128, "%d", j);
         do_test(!std::strcmp(buff1, buff2));
 
         wchar_t wbuf1[128], wbuf2[128];
@@ -490,7 +490,7 @@ static void test_format() {
     long q = LONG_MIN;
     char buff1[128], buff2[128];
     format_long_safe(buff1, q);
-    sprintf(buff2, "%ld", q);
+    snprintf(buff2, 128, "%ld", q);
     do_test(!std::strcmp(buff1, buff2));
 }
 
@@ -788,19 +788,6 @@ static void test_tokenizer() {
         err(L"redirection_type_for_string failed on line %ld", (long)__LINE__);
 }
 
-// Little function that runs in a background thread, bouncing to the main.
-static int test_iothread_thread_call(std::atomic<int> *addr) {
-    int before = *addr;
-    iothread_perform_on_main([=]() { *addr += 1; });
-    int after = *addr;
-
-    // Must have incremented it at least once.
-    if (before >= after) {
-        err(L"Failed to increment from background thread");
-    }
-    return after;
-}
-
 static void test_fd_monitor() {
     say(L"Testing fd_monitor");
 
@@ -935,17 +922,24 @@ static void test_fd_monitor() {
 
 static void test_iothread() {
     say(L"Testing iothreads");
-    std::unique_ptr<std::atomic<int>> int_ptr = make_unique<std::atomic<int>>(0);
-    int iterations = 64;
+    std::atomic<int> shared_int{0};
+    const int iterations = 64;
+    std::promise<void> prom;
     for (int i = 0; i < iterations; i++) {
-        iothread_perform([&]() { test_iothread_thread_call(int_ptr.get()); });
+        iothread_perform([&] {
+            int newv = 1 + shared_int.fetch_add(1, std::memory_order_relaxed);
+            if (newv == iterations) {
+                prom.set_value();
+            }
+        });
     }
-    iothread_drain_all();
+    auto status = prom.get_future().wait_for(std::chrono::seconds(64));
 
     // Should have incremented it once per thread.
-    do_test(*int_ptr == iterations);
-    if (*int_ptr != iterations) {
-        say(L"Expected int to be %d, but instead it was %d", iterations, int_ptr->load());
+    do_test(status == std::future_status::ready);
+    do_test(shared_int == iterations);
+    if (shared_int != iterations) {
+        say(L"Expected int to be %d, but instead it was %d", iterations, shared_int.load());
     }
 }
 
@@ -2544,6 +2538,11 @@ static void test_pager_navigation() {
         // East goes back.
         {selection_motion_t::east, 0},
 
+        {selection_motion_t::west, 15},
+        {selection_motion_t::west, 11},
+        {selection_motion_t::east, 15},
+        {selection_motion_t::east, 0},
+
         // "Next" motion goes down the column.
         {selection_motion_t::next, 1},
         {selection_motion_t::next, 2},
@@ -3216,7 +3215,7 @@ static void test_complete() {
 
     auto parser = parser_t::principal_parser().shared();
 
-    auto do_complete = [&](const wcstring &cmd, completion_request_flags_t flags) {
+    auto do_complete = [&](const wcstring &cmd, completion_request_options_t flags) {
         return complete(cmd, flags, operation_context_t{parser, vars, no_cancel});
     };
 
@@ -3254,7 +3253,9 @@ static void test_complete() {
     completions_sort_and_prioritize(&completions);
     do_test(completions.empty());
 
-    completions = do_complete(L"$1", completion_request_t::fuzzy_match);
+    completion_request_options_t fuzzy_options{};
+    fuzzy_options.fuzzy_match = true;
+    completions = do_complete(L"$1", fuzzy_options);
     completions_sort_and_prioritize(&completions);
     do_test(completions.size() == 3);
     do_test(completions.at(0).completion == L"$Bar1");
@@ -3394,7 +3395,7 @@ static void test_complete() {
     do_test(completions.at(0).completion == L"stfile");
     completions = do_complete(L"something abc=stfile", {});
     do_test(completions.empty());
-    completions = do_complete(L"something abc=stfile", completion_request_t::fuzzy_match);
+    completions = do_complete(L"something abc=stfile", fuzzy_options);
     do_test(completions.size() == 1);
     do_test(completions.at(0).completion == L"abc=testfile");
 
@@ -3566,7 +3567,7 @@ static void test_completion_insertions() {
 static void perform_one_autosuggestion_cd_test(const wcstring &command, const wcstring &expected,
                                                const environment_t &vars, long line) {
     completion_list_t comps =
-        complete(command, completion_request_t::autosuggestion, operation_context_t{vars});
+        complete(command, completion_request_options_t::autosuggest(), operation_context_t{vars});
 
     bool expects_error = (expected == L"<error>");
 
@@ -3754,8 +3755,8 @@ static void test_autosuggest_suggest_special() {
 }
 
 static void perform_one_autosuggestion_should_ignore_test(const wcstring &command, long line) {
-    completion_list_t comps =
-        complete(command, completion_request_t::autosuggestion, operation_context_t::empty());
+    completion_list_t comps = complete(command, completion_request_options_t::autosuggest(),
+                                       operation_context_t::empty());
     do_test(comps.empty());
     if (!comps.empty()) {
         const wcstring &suggestion = comps.front().completion;
@@ -3792,7 +3793,7 @@ static void test_autosuggestion_combining() {
 static void test_history_matches(history_search_t &search, const wcstring_list_t &expected,
                                  unsigned from_line) {
     wcstring_list_t found;
-    while (search.go_backwards()) {
+    while (search.go_to_next_match(history_search_direction_t::backward)) {
         found.push_back(search.current_string());
     }
     do_test_from(expected == found, from_line);
@@ -4427,21 +4428,6 @@ void history_tests_t::test_history_races() {
     }
 
     say(L"Testing history race conditions");
-
-    // It appears TSAN and ASAN's allocators do not release their locks properly in atfork, so
-    // allocating with multiple threads risks deadlock. Drain threads before running under ASAN.
-    // TODO: stop forking with these tests.
-    bool needs_thread_drain = false;
-#if __SANITIZE_ADDRESS__
-    needs_thread_drain |= true;
-#endif
-#if defined(__has_feature)
-    needs_thread_drain |= __has_feature(thread_sanitizer) || __has_feature(address_sanitizer);
-#endif
-
-    if (needs_thread_drain) {
-        iothread_drain_all();
-    }
 
     // Test concurrent history writing.
     // How many concurrent writers we have
@@ -5788,7 +5774,7 @@ static void run_one_string_test(const wchar_t *const *argv_raw, int expected_rc,
 
     wcstring args;
     for (const wcstring &arg : argv_list) {
-        args += escape_string(arg, ESCAPE_ALL) + L' ';
+        args += escape_string(arg) + L' ';
     }
     args.resize(args.size() - 1);
 
@@ -5798,8 +5784,7 @@ static void run_one_string_test(const wchar_t *const *argv_raw, int expected_rc,
             args.c_str(), expected_rc, got.c_str());
     } else if (outs.contents() != expected_out) {
         err(L"Test failed on line %lu: [%ls]: expected [%ls] but got [%ls]", __LINE__, args.c_str(),
-            escape_string(expected_out, ESCAPE_ALL).c_str(),
-            escape_string(outs.contents(), ESCAPE_ALL).c_str());
+            escape_string(expected_out).c_str(), escape_string(outs.contents()).c_str());
     }
 }
 
@@ -6701,6 +6686,164 @@ static void test_killring() {
     do_test((kill_entries() == wcstring_list_t{L"a", L"c", L"b", L"d"}));
 }
 
+namespace {
+using namespace re;
+
+// Basic tests for re, which wraps PCRE2.
+static void test_re_errs() {
+    say(L"Testing re");
+    flags_t flags{};
+    re_error_t error{};
+    maybe_t<regex_t> re;
+    do_test(!regex_t::try_compile(L"abc[", flags, &error));
+    do_test(error.code != 0);
+    do_test(!error.message().empty());
+
+    error = re_error_t{};
+    do_test(!regex_t::try_compile(L"abc(", flags, &error).has_value());
+    do_test(error.code != 0);
+    do_test(!error.message().empty());
+}
+
+static void test_re_basic() {
+    // Match a character twice.
+    using namespace re;
+    wcstring subject = L"AAbCCd11e";
+    auto substr_from_range = [&](maybe_t<match_range_t> r) {
+        do_test(r.has_value());
+        do_test(r->begin <= r->end);
+        do_test(r->end <= subject.size());
+        return subject.substr(r->begin, r->end - r->begin);
+    };
+    auto re = regex_t::try_compile(L"(.)\\1");
+    do_test(re.has_value());
+    auto md = re->prepare();
+    wcstring_list_t matches;
+    wcstring_list_t captures;
+    while (auto r = re->match(md, subject)) {
+        matches.push_back(substr_from_range(r));
+        captures.push_back(substr_from_range(re->group(md, 1)));
+        do_test(!re->group(md, 2));
+    }
+    do_test(join_strings(matches, L',') == L"AA,CC,11");
+    do_test(join_strings(captures, L',') == L"A,C,1");
+}
+
+static void test_re_reset() {
+    using namespace re;
+    auto re = regex_t::try_compile(L"([0-9])");
+    wcstring s = L"012345";
+    auto md = re->prepare();
+    for (size_t idx = 0; idx < s.size(); idx++) {
+        md.reset();
+        for (size_t j = 0; j <= idx; j++) {
+            auto m = re->match(md, s);
+            match_range_t expected{j, j + 1};
+            do_test(m == expected);
+            do_test(re->group(md, 1) == expected);
+        }
+    }
+}
+
+static void test_re_named() {
+    // Named capture groups.
+    using namespace re;
+    auto re = regex_t::try_compile(L"A(?<FOO>x+)?");
+    do_test(re->capture_group_count() == 1);
+
+    wcstring subject = L"AxxAAx";
+    auto md = re->prepare();
+
+    auto r = re->match(md, subject);
+    do_test((r == match_range_t{0, 3}));
+    do_test(re->substring_for_group(md, L"QQQ", subject) == none());
+    do_test(re->substring_for_group(md, L"FOO", subject) == L"xx");
+
+    r = re->match(md, subject);
+    do_test((r == match_range_t{3, 4}));
+    do_test(re->substring_for_group(md, L"QQQ", subject) == none());
+    do_test(re->substring_for_group(md, L"FOO", subject) == none());
+
+    r = re->match(md, subject);
+    do_test((r == match_range_t{4, 6}));
+    do_test(re->substring_for_group(md, L"QQQ", subject) == none());
+    do_test(re->substring_for_group(md, L"FOO", subject) == wcstring(L"x"));
+}
+
+static void test_re_name_extraction() {
+    // Names of capture groups can be extracted.
+    using namespace re;
+    auto re = regex_t::try_compile(L"(?<FOO>dd)ff(?<BAR>cc)aaa(?<alpha>)ff(?<BETA>)");
+    do_test(re.has_value());
+    do_test(re->capture_group_count() == 4);
+    // PCRE2 returns these sorted.
+    do_test(join_strings(re->capture_group_names(), L',') == L"BAR,BETA,FOO,alpha");
+
+    // Mixed named and positional captures.
+    re = regex_t::try_compile(L"(abc)(?<FOO>def)(ghi)(?<BAR>jkl)");
+    do_test(re.has_value());
+    do_test(re->capture_group_count() == 4);
+    do_test(join_strings(re->capture_group_names(), L',') == L"BAR,FOO");
+    auto md = re->prepare();
+    const wcstring subject = L"abcdefghijkl";
+    auto m = re->match(md, subject);
+    do_test((m == match_range_t{0, 12}));
+    do_test((re->group(md, 1) == match_range_t{0, 3}));
+    do_test((re->group(md, 2) == match_range_t{3, 6}));
+    do_test((re->group(md, 3) == match_range_t{6, 9}));
+    do_test((re->group(md, 4) == match_range_t{9, 12}));
+    do_test(re->substring_for_group(md, L"FOO", subject) == wcstring(L"def"));
+    do_test(re->substring_for_group(md, L"BAR", subject) == wcstring(L"jkl"));
+}
+
+static void test_re_substitute() {
+    // Names of capture groups can be extracted.
+    using namespace re;
+    auto re = regex_t::try_compile(L"[a-z]+(\\d+)");
+    do_test(re.has_value());
+    do_test(re->capture_group_count() == 1);
+    maybe_t<wcstring> res{};
+    int repl_count{};
+    sub_flags_t sflags{};
+    const wcstring subj = L"AAabc123ZZ AAabc123ZZ";
+    const wcstring repl = L"$1qqq";
+    res = re->substitute(subj, repl, sflags, 0, nullptr, &repl_count);
+    do_test(res && *res == L"AA123qqqZZ AAabc123ZZ");
+    do_test(repl_count == 1);
+
+    res = re->substitute(subj, repl, sflags, 5, nullptr, &repl_count);
+    do_test(res && *res == L"AAabc123ZZ AA123qqqZZ");
+    do_test(repl_count == 1);
+
+    sflags.global = true;
+    res = re->substitute(subj, repl, sflags, 0, nullptr, &repl_count);
+    do_test(res && *res == L"AA123qqqZZ AA123qqqZZ");
+    do_test(repl_count == 2);
+
+    sflags.extended = true;
+    res = re->substitute(subj, L"\\x21", sflags, 0, nullptr, &repl_count);  // \x21 = !
+    do_test(res && *res == L"AA!ZZ AA!ZZ");
+    do_test(repl_count == 2);
+
+    // Test with a bad escape; \b is unsupported.
+    re_error_t error{};
+    res = re->substitute(subj, L"AAA\\bZZZ", sflags, 0, &error);
+    do_test(!res.has_value());
+    do_test(error.code == -57 /* PCRE2_ERROR_BADREPESCAPE */);
+    do_test(error.message() == L"bad escape sequence in replacement string");
+    do_test(error.offset == 5 /* the b */);
+
+    // Test a very long replacement as we used a fixed-size buffer.
+    sflags = sub_flags_t{};
+    sflags.global = true;
+    re = regex_t::try_compile(L"A");
+    res =
+        re->substitute(wcstring(4096, L'A'), wcstring(4096, L'X'), sflags, 0, nullptr, &repl_count);
+    do_test(res && *res == wcstring(4096 * 4096, L'X'));
+    do_test(repl_count == 4096);
+}
+}  // namespace
+
 struct termsize_tester_t {
     static void test();
 };
@@ -6879,6 +7022,12 @@ static const test_t s_tests[]{
     {TEST_GROUP("timer_format"), test_timer_format},
     {TEST_GROUP("termsize"), termsize_tester_t::test},
     {TEST_GROUP("killring"), test_killring},
+    {TEST_GROUP("re"), test_re_errs},
+    {TEST_GROUP("re"), test_re_basic},
+    {TEST_GROUP("re"), test_re_reset},
+    {TEST_GROUP("re"), test_re_named},
+    {TEST_GROUP("re"), test_re_name_extraction},
+    {TEST_GROUP("re"), test_re_substitute},
 };
 
 void list_tests() {

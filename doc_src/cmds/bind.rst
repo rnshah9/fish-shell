@@ -81,6 +81,9 @@ The following options are available:
     All invocations except for inserting new bindings can operate on both levels at the same time (if both **--preset** and **--user** are given).
     **--preset** should only be used in full binding sets (like when working on ``fish_vi_key_bindings``).
 
+**-s** or **--silent**
+    Silences some of the error messages, including for unknown key names and unbound sequences.
+
 **-h** or **--help**
     Displays help about using this command.
 
@@ -193,6 +196,9 @@ The following special input functions are available:
     move one word to the right; or if at the end of the commandline, accept one word
     from the current autosuggestion.
 
+``history-pager``
+    invoke the searchable pager on history (incremental search); or if the history pager is already active, search further backwards in time.
+
 ``history-search-backward``
     search the history for the previous match
 
@@ -246,7 +252,7 @@ The following special input functions are available:
     only execute the next function if the previous succeeded (note: only some functions report success)
 
 ``pager-toggle-search``
-    toggles the search field if the completions pager is visible.
+    toggles the search field if the completions pager is visible; or if used after ``history-pager``, search forwards in time.
 
 ``prevd-or-backward-word``
     if the commandline is empty, then move backward in the directory history, otherwise move one word to the left

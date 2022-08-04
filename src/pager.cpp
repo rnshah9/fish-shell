@@ -153,7 +153,10 @@ line_t pager_t::completion_print_item(const wcstring &prefix, const comp_t *c, s
 
     highlight_role_t bg_role = modify_role(highlight_role_t::pager_background);
     highlight_spec_t bg = {highlight_role_t::normal, bg_role};
-    highlight_spec_t prefix_col = {modify_role(highlight_role_t::pager_prefix), bg_role};
+    highlight_spec_t prefix_col = {
+        modify_role(highlight_prefix ? highlight_role_t::pager_prefix
+                                     : highlight_role_t::pager_completion),
+        bg_role};
     highlight_spec_t comp_col = {modify_role(highlight_role_t::pager_completion), bg_role};
     highlight_spec_t desc_col = {modify_role(highlight_role_t::pager_description), bg_role};
 
@@ -310,7 +313,8 @@ static comp_info_list_t process_completions_into_infos(const completion_list_t &
         comp_t *comp_info = &result.at(i);
 
         // Append the single completion string. We may later merge these into multiple.
-        comp_info->comp.push_back(escape_string(comp.completion, ESCAPE_NO_QUOTED));
+        comp_info->comp.push_back(
+            escape_string(comp.completion, ESCAPE_NO_PRINTABLES | ESCAPE_NO_QUOTED));
 
         // Append the mangled description.
         comp_info->desc = comp.description;
@@ -376,6 +380,7 @@ void pager_t::refilter_completions() {
 }
 
 void pager_t::set_completions(const completion_list_t &raw_completions) {
+    selected_completion_idx = PAGER_SELECTION_NONE;
     // Get completion infos out of it.
     unfiltered_completion_infos = process_completions_into_infos(raw_completions);
 
@@ -387,9 +392,13 @@ void pager_t::set_completions(const completion_list_t &raw_completions) {
 
     // Refilter them.
     this->refilter_completions();
+    have_unrendered_completions = true;
 }
 
-void pager_t::set_prefix(const wcstring &pref) { prefix = pref; }
+void pager_t::set_prefix(const wcstring &pref, bool highlight) {
+    prefix = pref;
+    highlight_prefix = highlight;
+}
 
 void pager_t::set_term_size(termsize_t ts) {
     available_term_width = ts.width > 0 ? ts.width : 0;
@@ -496,9 +505,15 @@ bool pager_t::completion_try_print(size_t cols, const wcstring &prefix, const co
         // these are the "past the last value".
         progress_text =
             format_string(_(L"rows %lu to %lu of %lu"), start_row + 1, stop_row, row_count);
-    } else if (completion_infos.empty() && !unfiltered_completion_infos.empty()) {
+    } else if (search_field_shown && completion_infos.empty()) {
         // Everything is filtered.
         progress_text = _(L"(no matches)");
+    }
+    if (!extra_progress_text.empty()) {
+        if (!progress_text.empty()) {
+            progress_text += L". ";
+        }
+        progress_text += extra_progress_text;
     }
 
     if (!progress_text.empty()) {
@@ -574,6 +589,7 @@ page_rendering_t pager_t::render() const {
 }
 
 bool pager_t::rendering_needs_update(const page_rendering_t &rendering) const {
+    if (have_unrendered_completions) return true;
     // Common case is no pager.
     if (this->empty() && rendering.screen_data.empty()) return false;
 
@@ -588,9 +604,10 @@ bool pager_t::rendering_needs_update(const page_rendering_t &rendering) const {
            (rendering.remaining_to_disclose > 0 && this->fully_disclosed);
 }
 
-void pager_t::update_rendering(page_rendering_t *rendering) const {
+void pager_t::update_rendering(page_rendering_t *rendering) {
     if (rendering_needs_update(*rendering)) {
         *rendering = this->render();
+        have_unrendered_completions = false;
     }
 }
 
@@ -749,12 +766,15 @@ bool pager_t::select_next_completion_in_direction(selection_motion_t direction,
     // rendering.cols is the first suggested visible completion; add the visible completion
     // count to that to get the last one.
     size_t visible_row_count = rendering.row_end - rendering.row_start;
-    if (visible_row_count == 0 || selected_completion_idx == PAGER_SELECTION_NONE) {
+    if (visible_row_count == 0) {
+        return true;  // this happens if there was no room to draw the pager
+    }
+    if (selected_completion_idx == PAGER_SELECTION_NONE) {
         return true;  // this should never happen but be paranoid
     }
 
     // Ensure our suggested row start is not past the selected row.
-    size_t row_containing_selection = this->get_selected_row(rendering);
+    size_t row_containing_selection = this->get_selected_row(rendering.rows);
     if (suggested_row_start > row_containing_selection) {
         suggested_row_start = row_containing_selection;
     }
@@ -778,11 +798,17 @@ bool pager_t::select_next_completion_in_direction(selection_motion_t direction,
 
 size_t pager_t::visual_selected_completion_index(size_t rows, size_t cols) const {
     // No completions -> no selection.
-    if (completion_infos.empty() || rows == 0 || cols == 0) {
+    if (completion_infos.empty()) {
         return PAGER_SELECTION_NONE;
     }
 
     size_t result = selected_completion_idx;
+    if (result == 0) {
+        return result;
+    }
+    if (rows == 0 || cols == 0) {
+        return PAGER_SELECTION_NONE;
+    }
     if (result != PAGER_SELECTION_NONE) {
         // If the selected completion is beyond the last selection, go left by columns until it's
         // within it. This is how we implement "column memory".
@@ -803,7 +829,7 @@ bool pager_t::is_navigating_contents() const {
     return selected_completion_idx != PAGER_SELECTION_NONE;
 }
 
-void pager_t::set_fully_disclosed(bool flag) { fully_disclosed = flag; }
+void pager_t::set_fully_disclosed() { fully_disclosed = true; }
 
 const completion_t *pager_t::selected_completion(const page_rendering_t &rendering) const {
     const completion_t *result = nullptr;
@@ -820,27 +846,36 @@ const completion_t *pager_t::selected_completion(const page_rendering_t &renderi
 size_t pager_t::get_selected_row(const page_rendering_t &rendering) const {
     if (rendering.rows == 0) return PAGER_SELECTION_NONE;
 
-    return selected_completion_idx == PAGER_SELECTION_NONE
+    return rendering.selected_completion_idx == PAGER_SELECTION_NONE
                ? PAGER_SELECTION_NONE
-               : selected_completion_idx % rendering.rows;
+               : rendering.selected_completion_idx % rendering.rows;
+}
+
+size_t pager_t::get_selected_row(size_t rows) const {
+    if (rows == 0) return PAGER_SELECTION_NONE;
+
+    return selected_completion_idx == PAGER_SELECTION_NONE ? PAGER_SELECTION_NONE
+                                                           : selected_completion_idx % rows;
 }
 
 size_t pager_t::get_selected_column(const page_rendering_t &rendering) const {
     if (rendering.rows == 0) return PAGER_SELECTION_NONE;
 
-    return selected_completion_idx == PAGER_SELECTION_NONE
+    return rendering.selected_completion_idx == PAGER_SELECTION_NONE
                ? PAGER_SELECTION_NONE
-               : selected_completion_idx / rendering.rows;
+               : rendering.selected_completion_idx / rendering.rows;
 }
 
 void pager_t::clear() {
     unfiltered_completion_infos.clear();
     completion_infos.clear();
     prefix.clear();
+    highlight_prefix = false;
     selected_completion_idx = PAGER_SELECTION_NONE;
     fully_disclosed = false;
     search_field_shown = false;
     search_field_line.clear();
+    extra_progress_text.clear();
 }
 
 void pager_t::set_search_field_shown(bool flag) { this->search_field_shown = flag; }

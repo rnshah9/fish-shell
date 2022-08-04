@@ -17,6 +17,7 @@ Synopsis
     path is GENERAL_OPTIONS [(-v | --invert)] [(-t | --type) TYPE]
         [-d] [-f] [-l] [-r] [-w] [-x]
         [(-p | --perm) PERMISSION] [PATH ...]
+    path mtime GENERAL_OPTIONS [(-R | --relative)] [PATH ...]
     path normalize GENERAL_OPTIONS [PATH ...]
     path resolve GENERAL_OPTIONS [PATH ...]
     path change-extension GENERAL_OPTIONS EXTENSION [PATH ...]
@@ -234,6 +235,40 @@ Examples
    >_ path is -fx /bin/sh
    # /bin/sh is usually an executable file, so this returns true.
 
+"mtime" subcommand
+-----------------------
+
+::
+
+    path mtime [-z | --null-in] [-Z | --null-out] [-q | --quiet] [-R | --relative] [PATH ...]
+
+``path mtime`` returns the last modification time ("mtime" in unix jargon) of the given paths, in seconds since the unix epoch (the beginning of the 1st of January 1970).
+
+With ``--relative`` (or ``-R``), it prints the number of seconds since the modification time. It only reads the current time once at start, so in case multiple paths are given the times are all relative to the *start* of ``path mtime -R`` running.
+
+If you want to know if a file is newer or older than another file, consider using ``test -nt`` instead. See :ref:`the test documentation <cmd-test>`.
+
+It returns 0 if reading mtime for any path succeeded.
+
+Examples
+^^^^^^^^
+
+::
+
+    >_ date +%s
+    # This prints the current time as seconds since the epoch
+    1657217847
+
+    >_ path mtime /etc/
+    1657213796
+
+    >_ path mtime -R /etc/
+    4078
+    # So /etc/ on this system was last modified a little over an hour ago
+
+    # This is the same as
+    >_ math (date +%s) - (path mtime /etc/)
+
 "normalize" subcommand
 -----------------------
 
@@ -244,6 +279,8 @@ Examples
 ``path normalize`` returns the normalized versions of all paths. That means it squashes duplicate "/" (except for two leading "//"), collapses "../" with earlier components and removes "." components.
 
 Unlike ``realpath`` or ``path resolve``, it does not make the paths absolute. It also does not resolve any symlinks. As such it can operate on non-existent paths.
+
+Because it operates on paths as strings and doesn't resolve symlinks, it works sort of like ``pwd -L`` and ``cd``. E.g. ``path normalize link/..`` will return ``.``, just like ``cd link; cd ..`` would return to the current directory. For a physical view of the filesystem, see ``path resolve``.
 
 Leading "./" components are usually removed. But when a path starts with ``-``, ``path normalize`` will add it instead to avoid confusion with options.
 
@@ -275,9 +312,11 @@ Examples
 
     path resolve [-z | --null-in] [-Z | --null-out] [-q | --quiet] [PATH ...]
 
-``path resolve`` returns the normalized, physical and absolute versions of all paths. That means it resolves symlinks and does what ``path normalize`` does: it squashes duplicate "/" (except for two leading "//"), collapses "../" with earlier components and removes "." components. Then it turns that path into the absolute path starting from the filesystem root "/".
+``path resolve`` returns the normalized, physical and absolute versions of all paths. That means it resolves symlinks and does what ``path normalize`` does: it squashes duplicate "/", collapses "../" with earlier components and removes "." components. Then it turns that path into the absolute path starting from the filesystem root "/".
 
 It is similar to ``realpath``, as it creates the "real", canonical version of the path. However, for paths that can't be resolved, e.g. if they don't exist or form a symlink loop, it will resolve as far as it can and normalize the rest.
+
+Because it resolves symlinks, it works sort of like ``pwd -P``. E.g. ``path resolve link/..`` will return the parent directory of what the link points to, just like ``cd link; cd (pwd -P)/..`` would go to it. For a logical view of the filesystem, see ``path resolve``.
 
 It returns 0 if any normalization or resolution was done, i.e. any given path wasn't in canonical form.
 

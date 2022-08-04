@@ -145,9 +145,9 @@ struct file_id_t {
     dev_t device{static_cast<dev_t>(-1LL)};
     ino_t inode{static_cast<ino_t>(-1LL)};
     uint64_t size{static_cast<uint64_t>(-1LL)};
-    time_t change_seconds{-1};
+    time_t change_seconds{std::numeric_limits<time_t>::min()};
     long change_nanoseconds{-1};
-    time_t mod_seconds{-1};
+    time_t mod_seconds{std::numeric_limits<time_t>::min()};
     long mod_nanoseconds{-1};
 
     constexpr file_id_t() = default;
@@ -159,7 +159,7 @@ struct file_id_t {
     bool operator<(const file_id_t &rhs) const;
 
     static file_id_t from_stat(const struct stat &buf);
-
+    bool older_than(const file_id_t &rhs) const;
     wcstring dump() const;
 
    private:

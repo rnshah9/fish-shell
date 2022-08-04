@@ -138,11 +138,12 @@ enum {
 };
 typedef unsigned int unescape_flags_t;
 
-// Flags for the escape_string() and escape_string() functions. These are only applicable when the
-// escape style is "script" (i.e., STRING_STYLE_SCRIPT).
+// Flags for the escape_string() function. These are only applicable when the escape style is
+// "script" (i.e., STRING_STYLE_SCRIPT).
 enum {
-    /// Escape all characters, including magic characters like the semicolon.
-    ESCAPE_ALL = 1 << 0,
+    /// Do not escape special fish syntax characters like the semicolon. Only escape nonprintable
+    /// characters and backslashes.
+    ESCAPE_NO_PRINTABLES = 1 << 0,
     /// Do not try to use 'simplified' quoted escapes, and do not use empty quotes as the empty
     /// string.
     ESCAPE_NO_QUOTED = 1 << 1,
@@ -196,7 +197,7 @@ extern const wcstring g_empty_string;
 #define FATAL_EXIT()                                \
     do {                                            \
         char exit_read_buff;                        \
-        show_stackframe(L'E');                      \
+        show_stackframe();                          \
         ignore_result(read(0, &exit_read_buff, 1)); \
         exit_without_destructors(1);                \
     } while (0)
@@ -276,7 +277,7 @@ std::shared_ptr<T> move_to_sharedptr(T &&v) {
 using cancel_checker_t = std::function<bool()>;
 
 /// Print a stack trace to stderr.
-void show_stackframe(const wchar_t msg_level, int frame_count = 100, int skip_levels = 0);
+void show_stackframe(int frame_count = 100, int skip_levels = 0);
 
 /// Returns a  wide character string equivalent of the specified multibyte character string.
 ///
@@ -328,6 +329,7 @@ void format_size_safe(char buff[128], unsigned long long sz);
 /// Writes out a long safely.
 void format_long_safe(char buff[64], long val);
 void format_long_safe(wchar_t buff[64], long val);
+void format_llong_safe(wchar_t buff[64], long long val);
 void format_ullong_safe(wchar_t buff[64], unsigned long long val);
 
 /// "Narrows" a wide character string. This just grabs any ASCII characters and trunactes.
@@ -477,9 +479,9 @@ ssize_t read_loop(int fd, void *buff, size_t count);
 /// \param in The string to be escaped
 /// \param flags Flags to control the escaping
 /// \return The escaped string
-wcstring escape_string(const wchar_t *in, escape_flags_t flags,
+wcstring escape_string(const wchar_t *in, escape_flags_t flags = 0,
                        escape_string_style_t style = STRING_STYLE_SCRIPT);
-wcstring escape_string(const wcstring &in, escape_flags_t flags,
+wcstring escape_string(const wcstring &in, escape_flags_t flags = 0,
                        escape_string_style_t style = STRING_STYLE_SCRIPT);
 
 /// Escape a string so that it may be inserted into a double-quoted string.

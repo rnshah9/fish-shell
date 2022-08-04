@@ -129,6 +129,8 @@ using history_item_list_t = std::deque<history_item_t>;
 
 struct history_impl_t;
 
+enum class history_search_direction_t { forward, backward };
+
 class history_t : noncopyable_t, nonmovable_t {
     friend class history_tests_t;
     struct impl_wrapper_t;
@@ -262,9 +264,6 @@ class history_search_t {
     /// If deduping, the items we've seen.
     std::unordered_set<wcstring> deduper_;
 
-    /// return whether we are case insensitive.
-    bool ignores_case() const { return flags_ & history_search_ignore_case; }
-
     /// return whether we deduplicate items.
     bool dedup() const { return !(flags_ & history_search_no_dedup); }
 
@@ -272,8 +271,8 @@ class history_search_t {
     /// Gets the original search term.
     const wcstring &original_term() const { return orig_term_; }
 
-    /// Finds the previous search result (backwards in time). Returns true if one was found.
-    bool go_backwards();
+    // Finds the next search result. Returns true if one was found.
+    bool go_to_next_match(history_search_direction_t direction);
 
     /// Returns the current search result item. asserts if there is no current item.
     const history_item_t &current_item() const;
@@ -281,12 +280,23 @@ class history_search_t {
     /// Returns the current search result item contents. asserts if there is no current item.
     const wcstring &current_string() const;
 
+    /// Returns the index of the current history item.
+    size_t current_index() const;
+
+    /// return whether we are case insensitive.
+    bool ignores_case() const { return flags_ & history_search_ignore_case; }
+
     /// Construct from a history pointer; the caller is responsible for ensuring the history stays
     /// alive.
     history_search_t(history_t *hist, const wcstring &str,
                      enum history_search_type_t type = history_search_type_t::contains,
-                     history_search_flags_t flags = 0)
-        : history_(hist), orig_term_(str), canon_term_(str), search_type_(type), flags_(flags) {
+                     history_search_flags_t flags = 0, size_t starting_index = 0)
+        : history_(hist),
+          orig_term_(str),
+          canon_term_(str),
+          search_type_(type),
+          flags_(flags),
+          current_index_(starting_index) {
         if (ignores_case()) {
             std::transform(canon_term_.begin(), canon_term_.end(), canon_term_.begin(), towlower);
         }
@@ -295,8 +305,8 @@ class history_search_t {
     /// Construct from a shared_ptr. TODO: this should be the only constructor.
     history_search_t(const std::shared_ptr<history_t> &hist, const wcstring &str,
                      enum history_search_type_t type = history_search_type_t::contains,
-                     history_search_flags_t flags = 0)
-        : history_search_t(hist.get(), str, type, flags) {}
+                     history_search_flags_t flags = 0, size_t starting_index = 0)
+        : history_search_t(hist.get(), str, type, flags, starting_index) {}
 
     /** Default constructor. */
     history_search_t() = default;

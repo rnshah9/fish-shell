@@ -72,6 +72,9 @@ class autoload_file_cache_t {
     /// If \p allow_stale is true, allow stale entries; otherwise discard them.
     /// This returns an autoloadable file, or none() if there is no such file.
     maybe_t<autoloadable_file_t> check(const wcstring &cmd, bool allow_stale = false);
+
+    /// \return true if a command is cached (either as a hit or miss).
+    bool is_cached(const wcstring &cmd) const;
 };
 
 maybe_t<autoloadable_file_t> autoload_file_cache_t::locate_file(const wcstring &cmd) const {
@@ -142,6 +145,10 @@ maybe_t<autoloadable_file_t> autoload_file_cache_t::check(const wcstring &cmd, b
     return file;
 }
 
+bool autoload_file_cache_t::is_cached(const wcstring &cmd) const {
+    return known_files_.count(cmd) > 0 || misses_cache_.contains(cmd);
+}
+
 autoload_t::autoload_t(wcstring env_var_name)
     : env_var_name_(std::move(env_var_name)), cache_(make_unique<autoload_file_cache_t>()) {}
 
@@ -156,6 +163,8 @@ void autoload_t::invalidate_cache() {
 bool autoload_t::can_autoload(const wcstring &cmd) {
     return cache_->check(cmd, true /* allow stale */).has_value();
 }
+
+bool autoload_t::has_attempted_autoload(const wcstring &cmd) { return cache_->is_cached(cmd); }
 
 wcstring_list_t autoload_t::get_autoloaded_commands() const {
     wcstring_list_t result;
@@ -209,7 +218,7 @@ void autoload_t::perform_autoload(const wcstring &path, parser_t &parser) {
     // - we source the file.
     // We don't create a buffer or check ifs or create a read_limit
 
-    wcstring script_source = L"source " + escape_string(path, ESCAPE_ALL);
+    wcstring script_source = L"source " + escape_string(path);
     auto prev_statuses = parser.get_last_statuses();
     const cleanup_t put_back([&] { parser.set_last_statuses(prev_statuses); });
     parser.eval(script_source, io_chain_t{});

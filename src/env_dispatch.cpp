@@ -187,7 +187,6 @@ static void guess_emoji_width(const environment_t &vars) {
 
 /// React to modifying the given variable.
 void env_dispatch_var_change(const wcstring &key, env_stack_t &vars) {
-    ASSERT_IS_MAIN_THREAD();
     // Do nothing if not yet fully initialized.
     if (!s_var_dispatch_table) return;
 
@@ -213,6 +212,13 @@ static void handle_term_size_change(const env_stack_t &vars) {
 
 static void handle_fish_history_change(const env_stack_t &vars) {
     reader_change_history(history_session_id(vars));
+}
+
+static void handle_fish_cursor_selection_mode_change(const env_stack_t &vars) {
+    auto mode = vars.get(L"fish_cursor_selection_mode");
+    reader_change_cursor_selection_mode(mode && mode->as_string() == L"inclusive"
+                                            ? cursor_selection_mode_t::inclusive
+                                            : cursor_selection_mode_t::exclusive);
 }
 
 void handle_autosuggestion_change(const env_stack_t &vars) {
@@ -328,6 +334,8 @@ static std::unique_ptr<const var_dispatch_table_t> create_dispatch_table() {
     var_dispatch_table->add(L"TZ", handle_tz_change);
     var_dispatch_table->add(L"fish_use_posix_spawn", handle_fish_use_posix_spawn_change);
     var_dispatch_table->add(L"fish_trace", handle_fish_trace);
+    var_dispatch_table->add(L"fish_cursor_selection_mode",
+                            handle_fish_cursor_selection_mode_change);
 
     // This std::move is required to avoid a build error on old versions of libc++ (#5801),
     // but it causes a different warning under newer versions of GCC (observed under GCC 9.3.0,
@@ -438,21 +446,24 @@ static void update_fish_color_support(const environment_t &vars) {
 }
 
 // Try to initialize the terminfo/curses subsystem using our fallback terminal name. Do not set
-// `TERM` to our fallback. We're only doing this in the hope of getting a minimally functional
+// `TERM` to our fallback. We're only doing this in the hope of getting a functional
 // shell. If we launch an external command that uses TERM it should get the same value we were
 // given, if any.
 static void initialize_curses_using_fallbacks(const environment_t &vars) {
-    const wchar_t *const fallbacks[] = {L"ansi", L"dumb"};
+    // xterm-256color is the most used terminal type by a massive margin,
+    // especially counting terminals that are mostly compatible.
+    const wchar_t *const fallbacks[] = {L"xterm-256color", L"xterm", L"ansi", L"dumb"};
 
+    wcstring termstr = L"";
     auto term_var = vars.get(L"TERM");
-    if (term_var.missing_or_empty()) {
-        return;
+    if (!term_var.missing_or_empty()) {
+        termstr = term_var->as_string();
     }
 
     for (const wchar_t *fallback : fallbacks) {
         // If $TERM is already set to the fallback name we're about to use there isn't any point in
         // seeing if the fallback name can be used.
-        if (term_var->as_string() == fallback) {
+        if (termstr == fallback) {
             continue;
         }
 

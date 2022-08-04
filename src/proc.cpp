@@ -132,7 +132,7 @@ bool job_t::signal(int signal) {
     if (auto pgid = group->get_pgid()) {
         if (killpg(*pgid, signal) == -1) {
             char buffer[512];
-            sprintf(buffer, "killpg(%d, %s)", *pgid, strsignal(signal));
+            snprintf(buffer, 512, "killpg(%d, %s)", *pgid, strsignal(signal));
             wperror(str2wcstring(buffer).c_str());
             return false;
         }
@@ -361,7 +361,7 @@ static void reap_disowned_pids() {
 /// \param block_ok if no reapable processes have exited, block until one is (or until we receive a
 /// signal).
 static void process_mark_finished_children(parser_t &parser, bool block_ok) {
-    ASSERT_IS_MAIN_THREAD();
+    parser.assert_can_execute();
 
     // Get the exit and signal generations of all reapable processes.
     // The exit generation tells us if we have an exit; the signal generation allows for detecting
@@ -463,9 +463,9 @@ static void process_mark_finished_children(parser_t &parser, bool block_ok) {
 
 /// Generate process_exit events for any completed processes in \p j.
 static void generate_process_exit_events(const job_ref_t &j, std::vector<event_t> *out_evts) {
-    // Historically we have avoided generating events for jobs from event handlers, as an event
-    // handler may itself produce a new event.
-    if (!j->from_event_handler()) {
+    // Historically we have avoided generating events for foreground jobs from event handlers, as an
+    // event handler may itself produce a new event.
+    if (!j->from_event_handler() || !j->is_foreground()) {
         for (const auto &p : j->processes) {
             if (p->pid > 0 && p->completed && !p->posted_proc_exit) {
                 p->posted_proc_exit = true;
@@ -477,8 +477,8 @@ static void generate_process_exit_events(const job_ref_t &j, std::vector<event_t
 
 /// Given a job that has completed, generate job_exit and caller_exit events.
 static void generate_job_exit_events(const job_ref_t &j, std::vector<event_t> *out_evts) {
-    // Generate proc and job exit events, except for jobs originating in event handlers.
-    if (!j->from_event_handler()) {
+    // Generate proc and job exit events, except for foreground jobs originating in event handlers.
+    if (!j->from_event_handler() || !j->is_foreground()) {
         // job_exit events.
         if (j->posts_job_exit_events()) {
             if (auto last_pid = j->get_last_pid()) {
@@ -557,7 +557,7 @@ wcstring summary_command(const job_ref_t &j, const process_ptr_t &p = nullptr) {
 
     // Command.
     buffer.push_back(L' ');
-    buffer.append(escape_string(j->command(), ESCAPE_ALL));
+    buffer.append(escape_string(j->command()));
 
     if (!p) {
         // No process, we are summarizing the whole job.
@@ -567,17 +567,17 @@ wcstring summary_command(const job_ref_t &j, const process_ptr_t &p = nullptr) {
         // Arguments are the signal name and description.
         int sig = p->status.signal_code();
         buffer.push_back(L' ');
-        buffer.append(escape_string(sig2wcs(sig), ESCAPE_ALL));
+        buffer.append(escape_string(sig2wcs(sig)));
 
         buffer.push_back(L' ');
-        buffer.append(escape_string(signal_get_desc(sig), ESCAPE_ALL));
+        buffer.append(escape_string(signal_get_desc(sig)));
 
         // If we have multiple processes, we also append the pid and argv.
         if (j->processes.size() > 1) {
             append_format(buffer, L" %d", p->pid);
 
             buffer.push_back(L' ');
-            buffer.append(escape_string(p->argv0(), ESCAPE_ALL));
+            buffer.append(escape_string(p->argv0()));
         }
     }
     return buffer;
@@ -647,7 +647,7 @@ static void save_wait_handle_for_completed_job(const shared_ptr<job_t> &job,
 /// Remove completed jobs from the job list, printing status messages as appropriate.
 /// \return whether something was printed.
 static bool process_clean_after_marking(parser_t &parser, bool allow_interactive) {
-    ASSERT_IS_MAIN_THREAD();
+    parser.assert_can_execute();
 
     // This function may fire an event handler, we do not want to call ourselves recursively (to
     // avoid infinite recursion).
@@ -728,7 +728,7 @@ static bool process_clean_after_marking(parser_t &parser, bool allow_interactive
 }
 
 bool job_reap(parser_t &parser, bool allow_interactive) {
-    ASSERT_IS_MAIN_THREAD();
+    parser.assert_can_execute();
     // Early out for the common case that there are no jobs.
     if (parser.jobs().empty()) {
         return false;

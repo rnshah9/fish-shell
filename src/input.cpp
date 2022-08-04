@@ -130,6 +130,7 @@ static constexpr const input_function_metadata_t input_function_metadata[] = {
     {L"forward-jump-till", readline_cmd_t::forward_jump_till},
     {L"forward-single-char", readline_cmd_t::forward_single_char},
     {L"forward-word", readline_cmd_t::forward_word},
+    {L"history-pager", readline_cmd_t::history_pager},
     {L"history-prefix-search-backward", readline_cmd_t::history_prefix_search_backward},
     {L"history-prefix-search-forward", readline_cmd_t::history_prefix_search_forward},
     {L"history-search-backward", readline_cmd_t::history_search_backward},
@@ -275,15 +276,12 @@ void input_mapping_set_t::add(wcstring sequence, const wchar_t *command, const w
     input_mapping_set_t::add(std::move(sequence), &command, 1, mode, sets_mode, user);
 }
 
-static relaxed_atomic_bool_t s_input_initialized{false};
-
 /// Set up arrays used by readch to detect escape sequences for special keys and perform related
 /// initializations for our input subsystem.
 void init_input() {
     ASSERT_IS_MAIN_THREAD();
-    if (s_input_initialized) return;
-    s_input_initialized = true;
 
+    if (s_terminfo_mappings.is_set()) return;
     s_terminfo_mappings = create_input_terminfo();
 
     auto input_mapping = input_mappings();
@@ -755,12 +753,13 @@ char_event_t inputter_t::read_char(const command_handler_t &command_handler) {
                 }
                 case readline_cmd_t::func_and:
                 case readline_cmd_t::func_or: {
-                    // If previous function has right status, we keep reading tokens
+                    // If previous function has correct status, we keep reading tokens
                     if (evt.get_readline() == readline_cmd_t::func_and) {
-                        if (function_status_) return readch();
+                        // Don't return immediately, we might need to handle it here - like
+                        // self-insert.
+                        if (function_status_) continue;
                     } else {
-                        assert(evt.get_readline() == readline_cmd_t::func_or);
-                        if (!function_status_) return readch();
+                        if (!function_status_) continue;
                     }
                     // Else we flush remaining tokens
                     do {
@@ -905,7 +904,7 @@ static std::vector<terminfo_mapping_t> create_input_terminfo() {
 }
 
 bool input_terminfo_get_sequence(const wcstring &name, wcstring *out_seq) {
-    assert(s_input_initialized);
+    assert(s_terminfo_mappings.is_set());
     for (const terminfo_mapping_t &m : *s_terminfo_mappings) {
         if (name == m.name) {
             // Found the mapping.
@@ -923,8 +922,7 @@ bool input_terminfo_get_sequence(const wcstring &name, wcstring *out_seq) {
 }
 
 bool input_terminfo_get_name(const wcstring &seq, wcstring *out_name) {
-    assert(s_input_initialized);
-
+    assert(s_terminfo_mappings.is_set());
     for (const terminfo_mapping_t &m : *s_terminfo_mappings) {
         if (m.seq && seq == str2wcstring(*m.seq)) {
             out_name->assign(m.name);
@@ -936,8 +934,7 @@ bool input_terminfo_get_name(const wcstring &seq, wcstring *out_name) {
 }
 
 wcstring_list_t input_terminfo_get_names(bool skip_null) {
-    assert(s_input_initialized);
-
+    assert(s_terminfo_mappings.is_set());
     wcstring_list_t result;
     const auto &mappings = *s_terminfo_mappings;
     result.reserve(mappings.size());

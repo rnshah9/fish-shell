@@ -1,10 +1,6 @@
 // Implementation of the string builtin.
 #include "config.h"  // IWYU pragma: keep
 
-#define PCRE2_CODE_UNIT_WIDTH WCHAR_T_BITS
-#ifdef _WIN32
-#define PCRE2_STATIC
-#endif
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -29,12 +25,12 @@
 #include "../future_feature_flags.h"
 #include "../parse_util.h"
 #include "../parser.h"
+#include "../re.h"
 #include "../screen.h"
 #include "../wcstringutil.h"
 #include "../wgetopt.h"
 #include "../wildcard.h"
 #include "../wutil.h"  // IWYU pragma: keep
-#include "pcre2.h"
 
 // How many bytes we read() at once.
 // Bash uses 128 here, so we do too (see READ_CHUNK_SIZE).
@@ -268,6 +264,9 @@ static int handle_flag_1(const wchar_t **argv, parser_t &parser, io_streams_t &s
     string_unknown_option(parser, streams, cmd, argv[w.woptind - 1]);
     return STATUS_INVALID_ARGS;
 }
+
+using flag_handler_t = int (*)(const wchar_t **argv, parser_t &parser, io_streams_t &streams,
+                               const wgetopter_t &w, options_t *opts);
 
 static int handle_flag_N(const wchar_t **argv, parser_t &parser, io_streams_t &streams,
                          const wgetopter_t &w, options_t *opts) {
@@ -537,7 +536,7 @@ static int handle_flag_V(const wchar_t **argv, parser_t &parser, io_streams_t &s
 static int handle_flag_w(const wchar_t **argv, parser_t &parser, io_streams_t &streams,
                          const wgetopter_t &w, options_t *opts) {
     if (opts->width_valid) {
-        long width  = fish_wcstol(w.woptarg);
+        long width = fish_wcstol(w.woptarg);
         if (width < 0) {
             string_error(streams, _(L"%ls: Invalid width value '%ls'\n"), argv[0], w.woptarg);
             return STATUS_INVALID_ARGS;
@@ -617,12 +616,30 @@ static const struct woption long_options[] = {{L"all", no_argument, nullptr, 'a'
                                               {L"width", required_argument, nullptr, 'w'},
                                               {}};
 
-static const std::unordered_map<char, decltype(*handle_flag_N)> flag_to_function = {
-    {'N', handle_flag_N}, {'a', handle_flag_a}, {'c', handle_flag_c}, {'e', handle_flag_e},
-    {'f', handle_flag_f}, {'g', handle_flag_g}, {'i', handle_flag_i}, {'l', handle_flag_l},
-    {'m', handle_flag_m}, {'n', handle_flag_n}, {'q', handle_flag_q}, {'r', handle_flag_r},
-    {'s', handle_flag_s}, {'V', handle_flag_V}, {'v', handle_flag_v}, {'w', handle_flag_w},
-    {1, handle_flag_1}};
+static flag_handler_t get_handler_for_flag(char c) {
+    // clang-format off
+    switch (c) {
+        case 'N': return handle_flag_N;
+        case 'a': return handle_flag_a;
+        case 'c': return handle_flag_c;
+        case 'e': return handle_flag_e;
+        case 'f': return handle_flag_f;
+        case 'g': return handle_flag_g;
+        case 'i': return handle_flag_i;
+        case 'l': return handle_flag_l;
+        case 'm': return handle_flag_m;
+        case 'n': return handle_flag_n;
+        case 'q': return handle_flag_q;
+        case 'r': return handle_flag_r;
+        case 's': return handle_flag_s;
+        case 'V': return handle_flag_V;
+        case 'v': return handle_flag_v;
+        case 'w': return handle_flag_w;
+        case 1 : return handle_flag_1;
+        default: return nullptr;
+    }
+    // clang-format on
+}
 
 /// Parse the arguments for flags recognized by a specific string subcommand.
 static int parse_opts(options_t *opts, int *optind, int n_req_args, int argc, const wchar_t **argv,
@@ -633,9 +650,8 @@ static int parse_opts(options_t *opts, int *optind, int n_req_args, int argc, co
     int opt;
     wgetopter_t w;
     while ((opt = w.wgetopt_long(argc, argv, short_options, long_options, nullptr)) != -1) {
-        auto fn = flag_to_function.find(opt);
-        if (fn != flag_to_function.end()) {
-            int retval = fn->second(argv, parser, streams, w, opts);
+        if (auto fn = get_handler_for_flag(opt)) {
+            int retval = fn(argv, parser, streams, w, opts);
             if (retval != STATUS_CMD_OK) return retval;
         } else if (opt == ':') {
             streams.err.append(L"string ");  // clone of string_error
@@ -689,9 +705,8 @@ static int string_escape(parser_t &parser, io_streams_t &streams, int argc, cons
     // Currently, only the script style supports options.
     // Ignore them for other styles for now.
     escape_flags_t flags = 0;
-    if (opts.escape_style == STRING_STYLE_SCRIPT) {
-        flags = ESCAPE_ALL;
-        if (opts.no_quoted) flags |= ESCAPE_NO_QUOTED;
+    if (opts.escape_style == STRING_STYLE_SCRIPT && opts.no_quoted) {
+        flags |= ESCAPE_NO_QUOTED;
     }
 
     int nesc = 0;
@@ -832,19 +847,16 @@ namespace {
 class string_matcher_t {
    protected:
     const options_t opts;
-    io_streams_t &streams;
     int total_matched{0};
 
    public:
-    string_matcher_t(options_t opts_, io_streams_t &streams_)
-        : opts(std::move(opts_)), streams(streams_) {}
+    explicit string_matcher_t(const options_t &opts_) : opts(opts_) {}
 
     virtual ~string_matcher_t() = default;
-    virtual bool report_matches(const wcstring &arg) = 0;
+    virtual void report_matches(const wcstring &arg, io_streams_t &streams) = 0;
     int match_count() const { return total_matched; }
 
-    virtual bool is_valid() const = 0;
-    virtual void clear_capture_vars() {}
+    virtual void import_captures(env_stack_t &) {}
 };
 
 class wildcard_matcher_t final : public string_matcher_t {
@@ -852,9 +864,8 @@ class wildcard_matcher_t final : public string_matcher_t {
     wcstring wcpattern;
 
    public:
-    wildcard_matcher_t(const wchar_t * /*argv0*/, const wcstring &pattern, const options_t &opts,
-                       io_streams_t &streams)
-        : string_matcher_t(opts, streams), wcpattern(parse_util_unescape_wildcards(pattern)) {
+    wildcard_matcher_t(const wcstring &pattern, const options_t &opts)
+        : string_matcher_t(opts), wcpattern(parse_util_unescape_wildcards(pattern)) {
         if (opts.ignore_case) {
             wcpattern = wcstolower(std::move(wcpattern));
         }
@@ -871,7 +882,7 @@ class wildcard_matcher_t final : public string_matcher_t {
 
     ~wildcard_matcher_t() override = default;
 
-    bool report_matches(const wcstring &arg) override {
+    void report_matches(const wcstring &arg, io_streams_t &streams) override {
         // Note: --all is a no-op for glob matching since the pattern is always matched
         // against the entire argument.
         bool match;
@@ -893,143 +904,81 @@ class wildcard_matcher_t final : public string_matcher_t {
                 }
             }
         }
-        return true;
     }
-
-    bool is_valid() const override { return true; }
 };
 
-static wcstring pcre2_strerror(int err_code) {
-    wchar_t buf[128];
-    pcre2_get_error_message(err_code, reinterpret_cast<PCRE2_UCHAR *>(buf),
-                            sizeof(buf) / sizeof(wchar_t));
-    return buf;
+// Compile a regex, printing an error on failure.
+static maybe_t<re::regex_t> try_compile_regex(const wcstring &pattern, const options_t &opts,
+                                              const wchar_t *cmd, io_streams_t &streams) {
+    re::re_error_t error{};
+    re::flags_t flags{};
+    flags.icase = opts.ignore_case;
+    auto re = re::regex_t::try_compile(pattern, flags, &error);
+    if (!re) {
+        string_error(streams, _(L"%ls: Regular expression compile error: %ls\n"), cmd,
+                     error.message().c_str());
+        string_error(streams, L"%ls: %ls\n", cmd, pattern.c_str());
+        string_error(streams, L"%ls: %*ls\n", cmd, static_cast<int>(error.offset), L"^");
+    }
+    return re;
 }
 
-struct compiled_regex_t : noncopyable_t {
-    pcre2_code *code{nullptr};
-    pcre2_match_data *match{nullptr};
-
-    // The list of named capture groups.
-    wcstring_list_t capture_group_names;
-
-    compiled_regex_t(const wchar_t *argv0, const wcstring &pattern, bool ignore_case,
-                     io_streams_t &streams) {
-        // Disable some sequences that can lead to security problems.
-        uint32_t options = PCRE2_NEVER_UTF;
-#if PCRE2_CODE_UNIT_WIDTH < 32
-        options |= PCRE2_NEVER_BACKSLASH_C;
-#endif
-
-        int err_code = 0;
-        PCRE2_SIZE err_offset = 0;
-
-        code = pcre2_compile(PCRE2_SPTR(pattern.c_str()), pattern.length(),
-                             options | (ignore_case ? PCRE2_CASELESS : 0), &err_code, &err_offset,
-                             nullptr);
-        if (code == nullptr) {
-            string_error(streams, _(L"%ls: Regular expression compile error: %ls\n"), argv0,
-                         pcre2_strerror(err_code).c_str());
-            string_error(streams, L"%ls: %ls\n", argv0, pattern.c_str());
-            string_error(streams, L"%ls: %*ls\n", argv0, static_cast<int>(err_offset), L"^");
-            return;
+/// Check if a list of capture group names is valid for variables. If any are invalid then report an
+/// error to \p streams. \return true if all names are valid.
+static bool validate_capture_group_names(const wcstring_list_t &capture_group_names,
+                                         io_streams_t &streams) {
+    for (const wcstring &name : capture_group_names) {
+        if (env_var_t::flags_for(name.c_str()) & env_var_t::flag_read_only) {
+            streams.err.append_format(
+                L"Modification of read-only variable \"%ls\" is not allowed\n", name.c_str());
+            return false;
         }
-
-        this->capture_group_names = get_capture_group_names(code);
-        if (!validate_capture_group_names(streams)) {
-            return;
-        }
-
-        match = pcre2_match_data_create_from_pattern(code, nullptr);
-        assert(match);
-        this->valid_ = true;
     }
+    return true;
+}
 
-    /// \return the list of capture group names from \p code.
-    static wcstring_list_t get_capture_group_names(const pcre2_code *code) {
-        PCRE2_SPTR name_table;
-        uint32_t name_entry_size;
-        uint32_t name_count;
+class regex_matcher_t final : public string_matcher_t {
+    using regex_t = re::regex_t;
+    using match_data_t = re::match_data_t;
+    using match_range_t = re::match_range_t;
 
-        pcre2_pattern_info(code, PCRE2_INFO_NAMETABLE, &name_table);
-        pcre2_pattern_info(code, PCRE2_INFO_NAMEENTRYSIZE, &name_entry_size);
-        pcre2_pattern_info(code, PCRE2_INFO_NAMECOUNT, &name_count);
+    // The regex to match against.
+    const regex_t regex_;
 
-        struct name_table_entry_t {
-#if PCRE2_CODE_UNIT_WIDTH == 8
-            uint8_t match_index_msb;
-            uint8_t match_index_lsb;
-#if CHAR_BIT == PCRE2_CODE_UNIT_WIDTH
-            char name[];
-#else
-            char8_t name[];
-#endif
-#elif PCRE2_CODE_UNIT_WIDTH == 16
-            uint16_t match_index;
-#if WCHAR_T_BITS == PCRE2_CODE_UNIT_WIDTH
-            wchar_t name[];
-#else
-            char16_t name[];
-#endif
-#else
-            uint32_t match_index;
-#if WCHAR_T_BITS == PCRE2_CODE_UNIT_WIDTH
-            wchar_t name[];
-#else
-            char32_t name[];
-#endif  // WCHAR_T_BITS
-#endif  // PCRE2_CODE_UNIT_WIDTH
-        };
+    // Match data associated with the regex.
+    match_data_t match_data_;
 
-        const auto *names = reinterpret_cast<const name_table_entry_t *>(name_table);
-        wcstring_list_t result;
-        result.reserve(name_count);
-        for (uint32_t i = 0; i < name_count; ++i) {
-            const auto &name_entry = names[i * name_entry_size];
-            result.emplace_back(name_entry.name);
-        }
-        return result;
-    }
+    // map from group name to matched substrings, for the first argument.
+    std::map<wcstring, wcstring_list_t> first_match_captures_;
 
-    /// Check if our capture group names are valid. If any are invalid then report an error to \p
-    /// streams. \return true if all names are valid.
-    bool validate_capture_group_names(io_streams_t &streams) {
-        for (const wcstring &name : this->capture_group_names) {
-            if (env_var_t::flags_for(name.c_str()) & env_var_t::flag_read_only) {
-                // Modification of read-only variables is not allowed
-                streams.err.append_format(
-                    L"Modification of read-only variable \"%ls\" is not allowed\n", name.c_str());
-                return false;
+    void populate_captures_from_match(const wcstring &subject) {
+        for (auto &kv : first_match_captures_) {
+            const auto &name = kv.first;
+            wcstring_list_t &vals = kv.second;
+
+            // If there are multiple named groups and --all was used, we need to ensure that
+            // the indexes are always in sync between the variables. If an optional named
+            // group didn't match but its brethren did, we need to make sure to put
+            // *something* in the resulting array, and unfortunately fish doesn't support
+            // empty/null members so we're going to have to use an empty string as the
+            // sentinel value.
+            if (maybe_t<wcstring> capture =
+                    regex_.substring_for_group(match_data_, name, subject)) {
+                vals.push_back(capture.acquire());
+            } else if (this->opts.all) {
+                vals.emplace_back();
             }
         }
-        return true;
     }
-
-    ~compiled_regex_t() {
-        pcre2_match_data_free(match);
-        pcre2_code_free(code);
-    }
-
-    bool is_valid() const { return this->valid_; }
-
-   private:
-    bool valid_{false};
-};
-
-class pcre2_matcher_t final : public string_matcher_t {
-    const wchar_t *argv0;
-    compiled_regex_t regex;
-    parser_t &parser;
-    bool imported_vars = false;
 
     enum class match_result_t {
-        pcre2_error = -1,
         no_match = 0,
         match = 1,
     };
 
-    match_result_t report_match(const wcstring &arg, int pcre2_rc) {
-        if (pcre2_rc == PCRE2_ERROR_NOMATCH) {
+    match_result_t report_match(const wcstring &arg, maybe_t<match_range_t> mrange,
+                                io_streams_t &streams) const {
+        if (!mrange.has_value()) {
             if (opts.invert_match && !opts.quiet) {
                 if (opts.index) {
                     streams.out.append_format(L"1 %lu\n", arg.length());
@@ -1040,14 +989,6 @@ class pcre2_matcher_t final : public string_matcher_t {
             }
 
             return opts.invert_match ? match_result_t::match : match_result_t::no_match;
-        } else if (pcre2_rc < 0) {
-            string_error(streams, _(L"%ls: Regular expression match error: %ls\n"), argv0,
-                         pcre2_strerror(pcre2_rc).c_str());
-            return match_result_t::pcre2_error;
-        } else if (pcre2_rc == 0) {
-            // The output vector wasn't big enough. Should not happen.
-            string_error(streams, _(L"%ls: Regular expression internal error\n"), argv0);
-            return match_result_t::pcre2_error;
         } else if (opts.invert_match) {
             return match_result_t::no_match;
         }
@@ -1057,18 +998,15 @@ class pcre2_matcher_t final : public string_matcher_t {
             streams.out.push_back(L'\n');
         }
 
-        PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(regex.match);
         // If we have groups-only, we skip the first match, which is the full one.
-        for (int j = (opts.entire || opts.groups_only ? 1 : 0); j < pcre2_rc; j++) {
-            PCRE2_SIZE begin = ovector[2 * j];
-            PCRE2_SIZE end = ovector[2 * j + 1];
-
-            if (begin != PCRE2_UNSET && end != PCRE2_UNSET && !opts.quiet) {
+        size_t group_count = match_data_.matched_capture_group_count();
+        for (size_t j = (opts.entire || opts.groups_only ? 1 : 0); j < group_count; j++) {
+            maybe_t<match_range_t> cg = this->regex_.group(match_data_, j);
+            if (cg.has_value() && !opts.quiet) {
                 if (opts.index) {
-                    streams.out.append_format(L"%lu %lu", (begin + 1), (end - begin));
-                } else if (end > begin) {
-                    // May have end < begin if \K is used.
-                    streams.out.append(arg.substr(begin, end - begin));
+                    streams.out.append_format(L"%lu %lu", cg->begin + 1, cg->end - cg->begin);
+                } else {
+                    streams.out.append(arg.substr(cg->begin, cg->end - cg->begin));
                 }
                 streams.out.push_back(L'\n');
             }
@@ -1077,159 +1015,51 @@ class pcre2_matcher_t final : public string_matcher_t {
         return opts.invert_match ? match_result_t::no_match : match_result_t::match;
     }
 
-    class regex_importer_t {
-       private:
-        std::map<wcstring, wcstring_list_t> matches_;
-        env_stack_t &vars_;
-        const wcstring &haystack_;
-        const compiled_regex_t &regex_;
-        const bool all_flag_;
-        bool do_import_{false};
-
-       public:
-        regex_importer_t(env_stack_t &vars, const wcstring &haystack, const compiled_regex_t &regex,
-                         bool all_flag)
-            : vars_(vars), haystack_(haystack), regex_(regex), all_flag_(all_flag) {
-            for (const wcstring &name : regex_.capture_group_names) {
-                matches_.emplace(name, wcstring_list_t{});
-            }
-        }
-
-        /// This member function should be called each time a match is found
-        void import_vars() {
-            do_import_ = true;
-            PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(regex_.match);
-            for (auto &kv : matches_) {
-                const auto &name = kv.first;
-                wcstring_list_t &vals = kv.second;
-
-                // A named group may actually correspond to multiple group numbers, each of which
-                // might have to be enumerated.
-                PCRE2_SPTR first = nullptr;
-                PCRE2_SPTR last = nullptr;
-                int entry_size = pcre2_substring_nametable_scan(
-                    regex_.code, (PCRE2_SPTR)(name.c_str()), &first, &last);
-                if (entry_size <= 0) {
-                    FLOGF(warning, L"PCRE2 failure retrieving named matches");
-                    continue;
-                }
-
-                bool value_found = false;
-                for (const auto *group_ptr = first; group_ptr <= last; group_ptr += entry_size) {
-                    int group_num = group_ptr[0];
-
-                    PCRE2_SIZE *capture = ovector + (2 * group_num);
-                    PCRE2_SIZE begin = capture[0];
-                    PCRE2_SIZE end = capture[1];
-
-                    if (begin != PCRE2_UNSET && end != PCRE2_UNSET && end >= begin) {
-                        vals.push_back(haystack_.substr(begin, end - begin));
-                        value_found = true;
-                        break;
-                    }
-                }
-
-                // If there are multiple named groups and --all was used, we need to ensure that the
-                // indexes are always in sync between the variables. If an optional named group
-                // didn't match but its brethren did, we need to make sure to put *something* in the
-                // resulting array, and unfortunately fish doesn't support empty/null members so
-                // we're going to have to use an empty string as the sentinel value.
-                if (!value_found && all_flag_) {
-                    vals.emplace_back();
-                }
-            }
-        }
-
-        ~regex_importer_t() {
-            if (!do_import_) return;
-            for (auto &kv : matches_) {
-                const wcstring &name = kv.first;
-                wcstring_list_t &value = kv.second;
-                vars_.set(name, ENV_DEFAULT, std::move(value));
-            }
-        }
-    };
-
    public:
-    pcre2_matcher_t(const wchar_t *argv0_, const wcstring &pattern, const options_t &opts,
-                    io_streams_t &streams, parser_t &parser_)
-        : string_matcher_t(opts, streams),
-          argv0(argv0_),
-          regex(argv0_, pattern, opts.ignore_case, streams),
-          parser(parser_) {}
+    regex_matcher_t(regex_t regex, const options_t &opts)
+        : string_matcher_t(opts), regex_(std::move(regex)), match_data_(regex_.prepare()) {
+        // Populate first_match_captures_ with the capture group names and empty lists.
+        for (const wcstring &name : regex_.capture_group_names()) {
+            first_match_captures_.emplace(name, wcstring_list_t{});
+        }
+    }
 
-    ~pcre2_matcher_t() override = default;
+    ~regex_matcher_t() override = default;
 
-    bool report_matches(const wcstring &arg) override {
-        // A return value of true means all is well (even if no matches were found), false indicates
-        // an unrecoverable error.
-        assert(regex.code && "report_matches should only be called if the regex was valid");
+    void report_matches(const wcstring &arg, io_streams_t &streams) override {
+        using namespace re;
 
-        regex_importer_t var_importer(this->parser.vars(), arg, this->regex, opts.all);
+        match_data_.reset();
+        auto rc = report_match(arg, this->regex_.match(match_data_, arg), streams);
 
-        // See pcre2demo.c for an explanation of this logic.
-        PCRE2_SIZE arglen = arg.length();
-        auto rc = report_match(arg, pcre2_match(regex.code, PCRE2_SPTR(arg.c_str()), arglen, 0, 0,
-                                                regex.match, nullptr));
-
-        // We only import variables for the *first matching argument*
-        bool do_var_import = (rc == match_result_t::match && !imported_vars);
-        if (do_var_import) {
-            var_importer.import_vars();
-            imported_vars = true;
+        bool populate_captures = false;
+        if (rc == match_result_t::match) {
+            // We only populate captures for the *first matching argument*.
+            populate_captures = (total_matched == 0);
+            total_matched++;
         }
 
-        switch (rc) {
-            case match_result_t::pcre2_error:
-                return false;
-            case match_result_t::no_match:
-                return true;
-            case match_result_t::match:
-                total_matched++;
+        if (populate_captures) {
+            this->populate_captures_from_match(arg);
         }
-
-        if (opts.invert_match) return true;
 
         // Report any additional matches.
-        for (auto *ovector = pcre2_get_ovector_pointer(regex.match); opts.all; total_matched++) {
-            uint32_t options = 0;
-            PCRE2_SIZE offset = ovector[1];  // start at end of previous match
-
-            if (ovector[0] == ovector[1]) {
-                if (ovector[0] == arglen) break;
-                options = PCRE2_NOTEMPTY_ATSTART | PCRE2_ANCHORED;
+        if (!opts.invert_match && opts.all) {
+            while (auto mr = this->regex_.match(match_data_, arg)) {
+                auto rc = this->report_match(arg, mr, streams);
+                if (rc == match_result_t::match && populate_captures) {
+                    this->populate_captures_from_match(arg);
+                }
             }
-
-            rc = report_match(arg, pcre2_match(regex.code, PCRE2_SPTR(arg.c_str()), arglen, offset,
-                                               options, regex.match, nullptr));
-
-            if (rc == match_result_t::pcre2_error) {
-                // This shouldn't happen as we've already validated the regex above
-                return false;
-            }
-
-            // Call import_vars() before modifying the ovector
-            if (rc == match_result_t::match && do_var_import) {
-                var_importer.import_vars();
-            }
-
-            if (rc == match_result_t::no_match) {
-                if (options == 0 /* all matches found now */) break;
-                ovector[1] = offset + 1;
-            }
-        }
-        return true;
-    }
-
-    /// Override to clear our capture variables if we had no match.
-    void clear_capture_vars() override {
-        assert(!imported_vars && "Should not already have imported variables");
-        for (const wcstring &name : regex.capture_group_names) {
-            parser.vars().set_empty(name, ENV_DEFAULT);
         }
     }
 
-    bool is_valid() const override { return regex.is_valid(); }
+    void import_captures(env_stack_t &vars) override {
+        for (auto &kv : first_match_captures_) {
+            const wcstring &name = kv.first;
+            vars.set(name, ENV_DEFAULT, std::move(kv.second));
+        }
+    }
 };
 }  // namespace
 
@@ -1269,27 +1099,29 @@ static int string_match(parser_t &parser, io_streams_t &streams, int argc, const
     }
 
     std::unique_ptr<string_matcher_t> matcher;
-    if (opts.regex) {
-        matcher = make_unique<pcre2_matcher_t>(cmd, pattern, opts, streams, parser);
+    if (!opts.regex) {
+        // Globs cannot fail.
+        matcher = make_unique<wildcard_matcher_t>(pattern, opts);
     } else {
-        matcher = make_unique<wildcard_matcher_t>(cmd, pattern, opts, streams);
-    }
-    if (!matcher->is_valid()) {
-        // An error will have been printed by the constructor.
-        return STATUS_INVALID_ARGS;
-    }
-
-    arg_iterator_t aiter(argv, optind, streams);
-    while (const wcstring *arg = aiter.nextstr()) {
-        if (!matcher->report_matches(*arg)) {
+        // Compile the pattern as regex and validate capture group names as variables; both may
+        // fail. Note both try_compile_regex and validate_capture_group_names print an error on
+        // failure.
+        auto re = try_compile_regex(pattern, opts, cmd, streams);
+        if (!re || !validate_capture_group_names(re->capture_group_names(), streams)) {
             return STATUS_INVALID_ARGS;
         }
-        if (opts.quiet && matcher->match_count() > 0) return STATUS_CMD_OK;
+        matcher = make_unique<regex_matcher_t>(re.acquire(), opts);
     }
 
-    if (matcher->match_count() == 0) {
-        matcher->clear_capture_vars();
+    assert(matcher && "Should have a matcher");
+    arg_iterator_t aiter(argv, optind, streams);
+    while (const wcstring *arg = aiter.nextstr()) {
+        matcher->report_matches(*arg, streams);
+        if (opts.quiet && matcher->match_count() > 0) {
+            break;
+        }
     }
+    matcher->import_captures(parser.vars());
 
     return matcher->match_count() > 0 ? STATUS_CMD_OK : STATUS_CMD_ERROR;
 }
@@ -1369,7 +1201,7 @@ class string_replacer_t {
     virtual bool replace_matches(const wcstring &arg, bool want_newline) = 0;
 };
 
-class literal_replacer_t : public string_replacer_t {
+class literal_replacer_t final : public string_replacer_t {
     const wcstring pattern;
     const wcstring replacement;
     size_t patlen;
@@ -1407,15 +1239,14 @@ static maybe_t<wcstring> interpret_escapes(const wcstring &arg) {
     return result;
 }
 
-class regex_replacer_t : public string_replacer_t {
-    compiled_regex_t regex;
+class regex_replacer_t final : public string_replacer_t {
+    re::regex_t regex;
     maybe_t<wcstring> replacement;
 
    public:
-    regex_replacer_t(const wchar_t *argv0, const wcstring &pattern, const wcstring &replacement_,
+    regex_replacer_t(const wchar_t *argv0, re::regex_t regex, const wcstring &replacement_,
                      const options_t &opts, io_streams_t &streams)
-        : string_replacer_t(argv0, opts, streams),
-          regex(argv0, pattern, opts.ignore_case, streams) {
+        : string_replacer_t(argv0, opts, streams), regex(std::move(regex)) {
         if (feature_test(features_t::string_replace_backslash)) {
             replacement = replacement_;
         } else {
@@ -1466,62 +1297,32 @@ bool literal_replacer_t::replace_matches(const wcstring &arg, bool want_newline)
 /// A return value of true means all is well (even if no replacements were performed), false
 /// indicates an unrecoverable error.
 bool regex_replacer_t::replace_matches(const wcstring &arg, bool want_newline) {
-    if (!regex.code) return false;   // pcre2_compile() failed
+    using namespace re;
     if (!replacement) return false;  // replacement was an invalid string
 
-    // clang-format off
-    // SUBSTITUTE_OVERFLOW_LENGTH causes pcre to return the needed buffer length if the passed one is to small
-    // SUBSTITUTE_EXTENDED changes how substitution expressions are interpreted (`$` as the special character)
-    // SUBSTITUTE_UNSET_EMPTY treats unmatched capturing groups as empty instead of erroring.
-    // SUBSTITUTE_GLOBAL means more than one substitution happens.
-    // clang-format on
-    uint32_t options = PCRE2_SUBSTITUTE_OVERFLOW_LENGTH | PCRE2_SUBSTITUTE_EXTENDED |
-                       PCRE2_SUBSTITUTE_UNSET_EMPTY | (opts.all ? PCRE2_SUBSTITUTE_GLOBAL : 0);
-    size_t arglen = arg.length();
-    PCRE2_SIZE bufsize = (arglen == 0) ? 16 : 2 * arglen;
-    auto output = static_cast<wchar_t *>(malloc(sizeof(wchar_t) * bufsize));
-    int pcre2_rc;
-    PCRE2_SIZE outlen = bufsize;
+    sub_flags_t sflags{};
+    sflags.global = opts.all;
+    sflags.extended = true;
 
-    bool done = false;
-    while (!done) {
-        assert(output);
+    re_error_t error{};
+    int repl_count{};
+    maybe_t<wcstring> result =
+        this->regex.substitute(arg, *replacement, sflags, 0, &error, &repl_count);
 
-        pcre2_rc = pcre2_substitute(regex.code, PCRE2_SPTR(arg.c_str()), arglen,
-                                    0,  // start offset
-                                    options, regex.match,
-                                    nullptr,  // match_data
-                                    PCRE2_SPTR(replacement->c_str()), replacement->length(),
-                                    reinterpret_cast<PCRE2_UCHAR *>(output), &outlen);
-
-        if (pcre2_rc != PCRE2_ERROR_NOMEMORY || bufsize >= outlen) {
-            done = true;
-        } else {
-            bufsize = outlen;
-            auto new_output = static_cast<wchar_t *>(realloc(output, sizeof(wchar_t) * bufsize));
-            if (new_output) output = new_output;
-        }
-    }
-
-    bool rc = true;
-    if (pcre2_rc < 0) {
+    if (!result) {
         string_error(streams, _(L"%ls: Regular expression substitute error: %ls\n"), argv0,
-                     pcre2_strerror(pcre2_rc).c_str());
-        rc = false;
+                     error.message().c_str());
     } else {
-        wcstring outstr(output, outlen);
-        bool replacement_occurred = pcre2_rc > 0;
+        bool replacement_occurred = repl_count > 0;
         if (!opts.quiet && (!opts.filter || replacement_occurred)) {
-            streams.out.append(outstr);
+            streams.out.append(*result);
             if (want_newline) {
                 streams.out.append(L'\n');
             }
         }
-        total_replaced += pcre2_rc;
+        total_replaced += repl_count;
     }
-
-    free(output);
-    return rc;
+    return result.has_value();
 }
 
 static int string_replace(parser_t &parser, io_streams_t &streams, int argc, const wchar_t **argv) {
@@ -1540,7 +1341,13 @@ static int string_replace(parser_t &parser, io_streams_t &streams, int argc, con
 
     std::unique_ptr<string_replacer_t> replacer;
     if (opts.regex) {
-        replacer = make_unique<regex_replacer_t>(argv[0], pattern, replacement, opts, streams);
+        if (auto re = try_compile_regex(pattern, opts, argv[0], streams)) {
+            replacer =
+                make_unique<regex_replacer_t>(argv[0], re.acquire(), replacement, opts, streams);
+        } else {
+            // try_compile_regex prints an error.
+            return STATUS_INVALID_ARGS;
+        }
     } else {
         replacer = make_unique<literal_replacer_t>(argv[0], pattern, replacement, opts, streams);
     }

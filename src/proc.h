@@ -73,7 +73,12 @@ class proc_status_t {
     static constexpr int w_exitcode(int ret, int sig) {
 #ifdef W_EXITCODE
         return W_EXITCODE(ret, sig);
+#elif HAVE_WAITSTATUS_SIGNAL_RET
+        // It's encoded signal and then status
+        // The return status is in the lower byte.
+        return ((sig) << 8 | (ret));
 #else
+        // The status is encoded in the upper byte.
         return ((ret) << 8 | (sig));
 #endif
     }

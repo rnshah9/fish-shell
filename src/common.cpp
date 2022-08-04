@@ -95,8 +95,6 @@ const wchar_t *program_name;
 /// This is set during startup and not modified after.
 static relaxed_atomic_t<pid_t> initial_fg_process_group{-1};
 
-static void debug_shared(wchar_t msg_level, const wcstring &msg);
-
 #if defined(OS_IS_CYGWIN) || defined(WSL)
 // MS Windows tty devices do not currently have either a read or write timestamp. Those
 // respective fields of `struct stat` are always the current time. Which means we can't
@@ -224,17 +222,17 @@ bool is_windows_subsystem_for_linux() {
     return backtrace_text;
 }
 
-[[gnu::noinline]] void show_stackframe(const wchar_t msg_level, int frame_count, int skip_levels) {
+[[gnu::noinline]] void show_stackframe(int frame_count, int skip_levels) {
     if (frame_count < 1) return;
 
     wcstring_list_t bt = demangled_backtrace(frame_count, skip_levels + 2);
-    debug_shared(msg_level, L"Backtrace:\n" + join_strings(bt, L'\n') + L'\n');
+    FLOG(error, L"Backtrace:\n" + join_strings(bt, L'\n') + L'\n');
 }
 
 #else   // HAVE_BACKTRACE_SYMBOLS
 
-[[gnu::noinline]] void show_stackframe(const wchar_t msg_level, int, int) {
-    debug_shared(msg_level, L"Sorry, but your system does not support backtraces");
+[[gnu::noinline]] void show_stackframe(int, int) {
+    FLOGF(error, L"Sorry, but your system does not support backtraces");
 }
 #endif  // HAVE_BACKTRACE_SYMBOLS
 
@@ -606,17 +604,6 @@ bool should_suppress_stderr_for_tests() {
     return program_name && !std::wcscmp(program_name, TESTS_PROGRAM_NAME);
 }
 
-static void debug_shared(const wchar_t level, const wcstring &msg) {
-    pid_t current_pid;
-    if (!is_forked_child()) {
-        std::fwprintf(stderr, L"<%lc> %ls: %ls\n", level, program_name, msg.c_str());
-    } else {
-        current_pid = getpid();
-        std::fwprintf(stderr, L"<%lc> %ls: %d: %ls\n", level, program_name, current_pid,
-                      msg.c_str());
-    }
-}
-
 // Careful to not negate LLONG_MIN.
 static unsigned long long absolute_value(long long x) {
     if (x >= 0) return static_cast<unsigned long long>(x);
@@ -652,6 +639,16 @@ void format_long_safe(char buff[64], long val) {
 }
 
 void format_long_safe(wchar_t buff[64], long val) {
+    unsigned long long uval = absolute_value(val);
+    if (val >= 0) {
+        format_safe_impl(buff, 64, uval);
+    } else {
+        buff[0] = '-';
+        format_safe_impl(buff + 1, 63, uval);
+    }
+}
+
+void format_llong_safe(wchar_t buff[64], long long val) {
     unsigned long long uval = absolute_value(val);
     if (val >= 0) {
         format_safe_impl(buff, 64, uval);
@@ -882,7 +879,7 @@ wcstring escape_string_for_double_quotes(wcstring in) {
 static void escape_string_script(const wchar_t *orig_in, size_t in_len, wcstring &out,
                                  escape_flags_t flags) {
     const wchar_t *in = orig_in;
-    const bool escape_all = static_cast<bool>(flags & ESCAPE_ALL);
+    const bool escape_printables = !(flags & ESCAPE_NO_PRINTABLES);
     const bool no_quoted = static_cast<bool>(flags & ESCAPE_NO_QUOTED);
     const bool no_tilde = static_cast<bool>(flags & ESCAPE_NO_TILDE);
     const bool no_qmark = feature_test(features_t::qmark_noglob);
@@ -954,7 +951,7 @@ static void escape_string_script(const wchar_t *orig_in, size_t in_len, wcstring
                 case L'\\':
                 case L'\'': {
                     need_escape = need_complex_escape = true;
-                    out += L'\\';
+                    if (escape_printables || c == L'\\') out += L'\\';
                     out += *in;
                     break;
                 }
@@ -994,20 +991,20 @@ static void escape_string_script(const wchar_t *orig_in, size_t in_len, wcstring
                     bool char_is_normal = (c == L'~' && no_tilde) || (c == L'?' && no_qmark);
                     if (!char_is_normal) {
                         need_escape = true;
-                        if (escape_all) out += L'\\';
+                        if (escape_printables) out += L'\\';
                     }
                     out += *in;
                     break;
                 }
 
                 default: {
-                    if (*in < 32) {
-                        if (*in < 27 && *in > 0) {
+                    if (*in >= 0 && *in < 32) {
+                        need_escape = need_complex_escape = true;
+
+                        if (*in < 27 && *in != 0) {
                             out += L'\\';
                             out += L'c';
                             out += L'a' + *in - 1;
-
-                            need_escape = need_complex_escape = true;
                             break;
                         }
 
@@ -1016,7 +1013,6 @@ static void escape_string_script(const wchar_t *orig_in, size_t in_len, wcstring
                         out += L'x';
                         out += ((*in > 15) ? L'1' : L'0');
                         out += tmp > 9 ? L'a' + (tmp - 10) : L'0' + tmp;
-                        need_escape = need_complex_escape = true;
                     } else {
                         out += *in;
                     }
@@ -1029,7 +1025,7 @@ static void escape_string_script(const wchar_t *orig_in, size_t in_len, wcstring
     }
 
     // Use quoted escaping if possible, since most people find it easier to read.
-    if (!no_quoted && need_escape && !need_complex_escape && escape_all) {
+    if (!no_quoted && need_escape && !need_complex_escape && escape_printables) {
         wchar_t single_quote = L'\'';
         out.clear();
         out.reserve(2 + in_len);
@@ -1742,10 +1738,7 @@ void setup_fork_guards() {
                    [] { pthread_atfork(nullptr, nullptr, [] { is_forked_proc = true; }); });
 }
 
-void save_term_foreground_process_group() {
-    ASSERT_IS_MAIN_THREAD();
-    initial_fg_process_group = tcgetpgrp(STDIN_FILENO);
-}
+void save_term_foreground_process_group() { initial_fg_process_group = tcgetpgrp(STDIN_FILENO); }
 
 void restore_term_foreground_process_group_for_exit() {
     // We wish to restore the tty to the initial owner. There's two ways this can go wrong:
@@ -1833,7 +1826,7 @@ void redirect_tty_output() {
     } else {
         FLOGF(error, L"%s:%zu: failed assertion: %s", file, line, msg);
     }
-    show_stackframe(L'E', 99, 1);
+    show_stackframe(99, 1);
     abort();
 }
 
@@ -1874,14 +1867,16 @@ std::string get_executable_path(const char *argv0) {
     // https://opensource.apple.com/source/adv_cmds/adv_cmds-163/ps/print.c
     uint32_t buffSize = sizeof buff;
     if (_NSGetExecutablePath(buff, &buffSize) == 0) return std::string(buff);
-#elif defined(__BSD__) && defined(KERN_PROC_PATHNAME) && !defined(__NetBSD__)
+#elif defined(__BSD__) && defined(KERN_PROC_PATHNAME)
     // BSDs do not have /proc by default, (although it can be mounted as procfs via the Linux
     // compatibility layer). We can use sysctl instead: per sysctl(3), passing in a process ID of -1
     // returns the value for the current process.
-    //
-    // (this is broken on NetBSD, while /proc works, so we use that)
     size_t buff_size = sizeof buff;
+#if defined(__NetBSD__)
+    int name[] = {CTL_KERN, KERN_PROC_ARGS, getpid(), KERN_PROC_PATHNAME};
+#else
     int name[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+#endif
     int result = sysctl(name, sizeof(name) / sizeof(int), buff, &buff_size, nullptr, 0);
     if (result != 0) {
         wperror(L"sysctl KERN_PROC_PATHNAME");
@@ -1900,7 +1895,18 @@ std::string get_executable_path(const char *argv0) {
     }
     if (len > 0) {
         buff[len] = '\0';
-        return std::string(buff);
+        // When /proc/self/exe points to a file that was deleted (or overwritten on update!)
+        // then linux adds a " (deleted)" suffix.
+        // If that's not a valid path, let's remove that awkward suffix.
+        std::string buffstr{buff};
+        if (access(buff, F_OK)) {
+            auto dellen = const_strlen(" (deleted)");
+            if (buffstr.size() > dellen &&
+                buffstr.compare(buffstr.size() - dellen, dellen, " (deleted)") == 0) {
+                buffstr = buffstr.substr(0, buffstr.size() - dellen);
+            }
+        }
+        return buffstr;
     }
 #endif
 
@@ -1941,14 +1947,14 @@ std::string get_path_to_tmp_dir() {
 // bullet-proof and that's OK.
 bool is_console_session() {
     static const bool console_session = [] {
-        ASSERT_IS_MAIN_THREAD();
-
-        const char *tty_name = ttyname(0);
+        char tty_name[PATH_MAX];
+        if (ttyname_r(STDIN_FILENO, tty_name, sizeof tty_name) != 0) {
+            return false;
+        }
         constexpr auto len = const_strlen("/dev/tty");
         const char *TERM = getenv("TERM");
         return
             // Test that the tty matches /dev/(console|dcons|tty[uv\d])
-            tty_name &&
             ((strncmp(tty_name, "/dev/tty", len) == 0 &&
               (tty_name[len] == 'u' || tty_name[len] == 'v' || isdigit(tty_name[len]))) ||
              strcmp(tty_name, "/dev/dcons") == 0 || strcmp(tty_name, "/dev/console") == 0)

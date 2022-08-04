@@ -116,7 +116,12 @@ class pager_t {
     // The unfiltered list. Note there's a lot of duplication here.
     comp_info_list_t unfiltered_completion_infos;
 
+    // This tracks if the completion list has been changed since we last rendered. If yes,
+    // then we definitely need to re-render.
+    bool have_unrendered_completions = false;
+
     wcstring prefix;
+    bool highlight_prefix = false;
 
     bool completion_try_print(size_t cols, const wcstring &prefix, const comp_info_list_t &lst,
                               page_rendering_t *rendering, size_t suggested_start_row) const;
@@ -137,11 +142,14 @@ class pager_t {
     // The text of the search field.
     editable_line_t search_field_line;
 
+    // Extra text to display at the bottom of the pager.
+    wcstring extra_progress_text{};
+
     // Sets the set of completions.
     void set_completions(const completion_list_t &raw_completions);
 
     // Sets the prefix.
-    void set_prefix(const wcstring &pref);
+    void set_prefix(const wcstring &pref, bool highlight = true);
 
     // Sets the terminal size.
     void set_term_size(termsize_t ts);
@@ -157,6 +165,8 @@ class pager_t {
     // Indicates the row and column for the given rendering. Returns -1 if no selection.
     size_t get_selected_row(const page_rendering_t &rendering) const;
     size_t get_selected_column(const page_rendering_t &rendering) const;
+    // Indicates the row assuming we render this many rows. Returns -1 if no selection.
+    size_t get_selected_row(size_t rows) const;
 
     // Produces a rendering of the completions, at the given term size.
     page_rendering_t render() const;
@@ -165,7 +175,7 @@ class pager_t {
     bool rendering_needs_update(const page_rendering_t &rendering) const;
 
     // Updates the rendering.
-    void update_rendering(page_rendering_t *rendering) const;
+    void update_rendering(page_rendering_t *rendering);
 
     // Indicates if there are no completions, and therefore nothing to render.
     bool empty() const;
@@ -186,7 +196,7 @@ class pager_t {
     bool is_navigating_contents() const;
 
     // Become fully disclosed.
-    void set_fully_disclosed(bool flag);
+    void set_fully_disclosed();
 
     // Position of the cursor.
     size_t cursor_position() const;
