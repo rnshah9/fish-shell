@@ -1,5 +1,5 @@
 project: fish-shell
-target: fish
+target: str2wcstring
 cmds:
-  - cmd: /fuzz
+  - cmd: /fuzz_str2wcstring
     libfuzzer: true

@@ -8,7 +8,7 @@ COPY . /repo
 WORKDIR /repo/build
 RUN cmake .. -DCMAKE_INSTALL_PREFIX=/install
 RUN make -j8
-RUN clang++ /repo/mayhem/harness.cpp -L/repo/build -lfishlib -lcurses -lpcre2-32 -fsanitize=address,fuzzer -o /fuzz -I/repo/src -I/repo/build
+RUN clang++ /repo/mayhem/fuzz_str2wcstring -L/repo/build -lfishlib -lcurses -lpcre2-32 -fsanitize=address,fuzzer -o /fuzz -I/repo/src -I/repo/build
 
 FROM ubuntu:22.04 as package
-COPY --from=builder /fuzz /fuzz
+COPY --from=builder /fuzz /fuzz_str2wcstring
