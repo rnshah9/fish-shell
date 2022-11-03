@@ -1,4 +1,5 @@
 project: fish-shell
 target: fish
 cmds:
-  - cmd: /install/bin/fish
+  - cmd: /fuzz
+    libfuzzer: true
